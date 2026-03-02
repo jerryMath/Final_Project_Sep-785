@@ -4,4 +4,4 @@ export N_IMGS=300
 
 export CVAE_CKPT=./runs_cvae/cvae_ep50.pt
 
-python eval_new.py
+python eval.py

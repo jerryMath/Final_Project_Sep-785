@@ -1,112 +1,215 @@
+import torch
 import os
 from datetime import datetime
-
-import torch
-import torchvision.utils as vutils
-from torch.utils.data import DataLoader, Subset
-from tqdm import tqdm
-
-from dataset import PairedImageFolder
-from models_cvae import CVAE
-from models_ddpm import CondUNet, DDPM
-
+import glob
+from model_incontext_revise import DiT_incontext_revise
+from diffusion import create_diffusion
+from vae.autoencoder import AutoencoderKL
+from vae.cond_encoder import CondEncoder
+from vae.encoder_decoder import Decoder2
+from torchvision.utils import save_image
+import natsort
+from torchvision.transforms import ToTensor
+import cv2
+import numpy as np
+import random
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+from models_cvae import CVAE
+import pyiqa
 
 
-def denorm(x):
+# Optimized settings
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+seed = 0
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
+torch.use_deterministic_algorithms(True)
+
+
+def load_model(model_name):
+    checkpoint = torch.load(model_name, map_location=lambda storage, loc: storage)
+    if "ema" in checkpoint:  # supports checkpoints from train.py
+        checkpoint = checkpoint["ema"]
+    return checkpoint
+
+
+def fiFindByWildcard(wildcard):
+    return natsort.natsorted(glob.glob(wildcard, recursive=True))
+
+
+def t(array):
+    return torch.Tensor(np.expand_dims(array.transpose([2, 0, 1]),
+                                       axis=0).astype(np.float32)) / 255
+
+
+def rgb(t):
+    return (np.clip((t[0] if len(t.shape) == 4 else t).detach().cpu().numpy().transpose(
+        [1, 2, 0]), 0, 1) * 255).astype(np.uint8)
+
+
+def imread(path):
+    return cv2.imread(path)[:, :, [2, 1, 0]]
+
+def to_m11(x01: torch.Tensor) -> torch.Tensor:
+    # [0,1] -> [-1,1]
+    return x01 * 2.0 - 1.0
+
+def to_01(xm11: torch.Tensor) -> torch.Tensor:
     # [-1,1] -> [0,1]
-    return (x * 0.5 + 0.5).clamp(0, 1)
+    return (xm11 + 1.0) / 2.0
 
+def clamp01(x: torch.Tensor) -> torch.Tensor:
+    return x.clamp(0.0, 1.0)
 
-@torch.no_grad()
-def main():
-    data_root = os.environ.get("DATA_ROOT", "./data_root")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    image_size = int(os.environ.get("IMG_SIZE", 256))
-
+def main(inp_dir):
+    lr_dir = os.path.join(inp_dir, 'low')
+    high_dir = os.path.join(inp_dir, 'high')
+    out_dir = os.path.join(inp_dir, 'outputs_diffusion_only')
     # Save filename timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    out_root = os.environ.get("OUT_DIR", "./eval_compare")
-    out_root = os.path.join(out_root, timestamp)
-    os.makedirs(out_root, exist_ok=True)
+    out_compare = os.environ.get("OUT_DIR", "./eval_compare")
+    out_compare = os.path.join(out_compare, timestamp)
+    os.makedirs(out_compare, exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
 
-    # Only evaluate first N images (default 3)
-    n_imgs = int(os.environ.get("N_IMGS", 3))
+    lr_paths = fiFindByWildcard(os.path.join(lr_dir, '*.png'))
+    high_paths = fiFindByWildcard(os.path.join(high_dir, '*.png'))
 
-    # ----- Dataset -----
-    ds_full = PairedImageFolder(data_root, split="test", image_size=image_size, random_flip=False)
-    n_take = min(n_imgs, len(ds_full))
-    ds = Subset(ds_full, list(range(n_take)))
-    dl = DataLoader(ds, batch_size=1, shuffle=False)
+    device = torch.device('cuda:0')
 
     # ----- Load cVAE -----
     cvae_ckpt_path = os.environ.get("CVAE_CKPT", "./runs_cvae/cvae_ep50.pt")
     cvae = CVAE(base_ch=64, z_dim=128).to(device)
     cvae_ckpt = torch.load(cvae_ckpt_path, map_location=device)
     cvae.load_state_dict(cvae_ckpt["model"])
+    cvae = cvae.to(device)
     cvae.eval()
 
-    # ----- Load DDPM (residual diffusion) -----
-    ddpm_ckpt_path = os.environ.get("DDPM_CKPT", "./runs_ddpm/ddpm_res_ep50.pt")
-    ddpm_ckpt = torch.load(ddpm_ckpt_path, map_location=device)
+    # Transformer based on diffusions
+    # diffusion Transformer backbone, with GPP-LN and LPP-Attn inside
+    state_dict = load_model('./weights/1.pth')
+    model = DiT_incontext_revise()
+    model.load_state_dict(state_dict, strict=True)
+    model = model.to(device)
 
-    T = int(os.environ.get("T", ddpm_ckpt.get("T", 1000)))
-    beta1 = float(os.environ.get("BETA1", ddpm_ckpt.get("beta1", 1e-4)))
-    beta2 = float(os.environ.get("BETA2", ddpm_ckpt.get("beta2", 0.02)))
-    steps = int(os.environ.get("STEPS", T))  # for best quality, use STEPS=T
+    # Conditional Encoder
+    # encodes the input + priors into conditioning tokens
+    cond_lq = CondEncoder()
+    state_dict = load_model('./weights/1_condencoder.pth')
+    cond_lq.load_state_dict(state_dict, strict=True)
+    cond_lq = cond_lq.to(device)
 
-    net = CondUNet(base_ch=64, img_ch=3, time_dim=256)
-    ddpm = DDPM(net, timesteps=T, beta1=beta1, beta2=beta2, device=device)
-    ddpm.model.load_state_dict(ddpm_ckpt["model"])
-    ddpm.model.eval()
+    # Variational Auto-encoder
+    # KL: KL divergence
+    state_dict = torch.load('./weights/weight_lolv1.pth', map_location=device)
+    vae = AutoencoderKL()
+    vae.load_state_dict(state_dict['vae'], strict=True)
+    vae = vae.to(device)
 
+    # Decoder2
+    # second-stage refinement decoder
+    second_decoder = Decoder2()
+    state_dict = load_model('./weights/1_seconddecoder.pth')
+    second_decoder.load_state_dict(state_dict, strict=True)
+    second_decoder = second_decoder.to(device)
+    model.eval()
+    diffusion_val = create_diffusion(str(100))  # number of sample steps
+
+    to_tensor = ToTensor()
     # ----- Metrics -----
     psnr = PeakSignalNoiseRatio(data_range=1.0).to(device)
     ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+    niqe = pyiqa.create_metric('niqe', device=device)
 
+    cvae_niqe, ddpm_niqe = [], []
     cvae_psnr, ddpm_psnr = [], []
     cvae_ssim, ddpm_ssim = [], []
 
-    for low, high, fn in tqdm(dl, desc=f"Comparing first {n_take}"):
-        low = low.to(device)
-        high = high.to(device)
+    for lr_path, high_path in zip(lr_paths, high_paths):
+        print(f"=== lr_path: {lr_path}")
+        # Clean up memory from previous loop
+        torch.cuda.empty_cache()
+
+        # y = t(imread(lr_path)).to(device)
+        img = to_tensor(cv2.cvtColor(cv2.imread(lr_path), cv2.COLOR_BGR2RGB)).unsqueeze(0) # [0, 1], RGB
+        img_high = to_tensor(cv2.cvtColor(cv2.imread(high_path), cv2.COLOR_BGR2RGB)).unsqueeze(0) # [0, 1], RGB
 
         # cVAE inference (deterministic z=0)
+        low_01 = img.to(device)              # [0,1]
+        low_m11 = to_m11(low_01)             # [-1,1]
         z = torch.zeros((1, cvae.z_dim), device=device)
-        cvae_pred = cvae.decode(low, z)
+        cvae_pred_m11 = cvae.decode(low_m11, z)      # [-1,1] (tanh)
+        cvae_pred_01 = clamp01(to_01(cvae_pred_m11)) # [0,1]
 
-        # DDPM inference: sample residual then add back to low
-        ddpm_res = ddpm.sample(low, steps=steps)  # residual_hat in [-1,1] (clamped in ddpm)
-        ddpm_pred = torch.clamp(low + 2.0 * ddpm_res, -1, 1)  # final enhanced
+        b, c, h, w = img.shape
+        # use less memo and run faster without calculating gradients
+        with torch.no_grad():
+            y, enc_feat = cond_lq(img.to(device), True)
+            latent_size_h = h // 4
+            latent_size_w = w // 4
+            z = torch.randn(1, 3, latent_size_h, latent_size_w, device=device)
+            model_kwargs = dict(y=y)
 
-        # to [0,1]
-        low01 = denorm(low)
-        high01 = denorm(high)
-        cvae01 = denorm(cvae_pred)
-        ddpm01 = denorm(ddpm_pred)
+            # Sample images:
+            # reverse diffusion process
+            samples = diffusion_val.p_sample_loop(
+                model.forward, z.shape, z, clip_denoised=False,
+                model_kwargs=model_kwargs, progress=False, device=device
+            )
+            dec_feat = vae.decode(samples, mid_feat=True)
+            sr = second_decoder(samples, dec_feat, enc_feat)
 
-        # metrics
-        cvae_psnr.append(psnr(cvae01, high01).item())
-        cvae_ssim.append(ssim(cvae01, high01).item())
+            low01 = img.to(device)
+            high01 = img_high.to(device)
+            cvae01 = cvae_pred_01
+            ddpm01 = sr.clamp(0.0, 1.0)
 
-        ddpm_psnr.append(psnr(ddpm01, high01).item())
-        ddpm_ssim.append(ssim(ddpm01, high01).item())
+            print("low01:", low01.min().item(), low01.max().item())
+            print("high01:", high01.min().item(), high01.max().item())
+            print("cvae01:", cvae01.min().item(), cvae01.max().item())
+            print("ddpm01:", ddpm01.min().item(), ddpm01.max().item())
 
-        # save: low | cVAE | DDPM | GT
-        grid = torch.cat([low01, cvae01, ddpm01, high01], dim=0)
+            cvae_niqe.append(niqe(cvae01))
+            ddpm_niqe.append(niqe(ddpm01))
+            
+            cvae_psnr.append(psnr(cvae01, high01).item())
+            cvae_ssim.append(ssim(cvae01, high01).item())
 
-        base = os.path.splitext(fn[0])[0]
-        save_name = f"{base}.png"
-        vutils.save_image(grid, os.path.join(out_root, save_name), nrow=4)
+            ddpm_psnr.append(psnr(ddpm01, high01).item())
+            ddpm_ssim.append(ssim(ddpm01, high01).item())
+
+            # save: low | cVAE | DDPM | GT
+            grid = torch.cat([low01, cvae01, ddpm01, high01], dim=0)
+
+            base = os.path.splitext(os.path.basename(lr_path))[0]
+            save_name = f"{base}.png"
+            save_image(grid, os.path.join(out_compare, save_name), nrow=4)
+
+            save_img_path = os.path.join(out_dir, os.path.basename(lr_path))
+            print(f"=== save_img_path: {save_img_path}")
+            save_image(sr, save_img_path)
+
 
     print("\n===== Final Results =====")
     print(f"cVAE  PSNR: {sum(cvae_psnr) / len(cvae_psnr):.3f}")
     print(f"cVAE  SSIM: {sum(cvae_ssim) / len(cvae_ssim):.4f}")
+    print(f"cVAE  NIQE: {sum(cvae_niqe) / len(cvae_niqe):.3f}")
+
     print(f"DDPM  PSNR: {sum(ddpm_psnr) / len(ddpm_psnr):.3f}")
     print(f"DDPM  SSIM: {sum(ddpm_ssim) / len(ddpm_ssim):.4f}")
-    print(f"Saved comparison images to: {out_root}")
+    print(f"DDPM  NIQE: {sum(ddpm_niqe) / len(ddpm_niqe):.4f}")
+    print(f"Saved comparison images to: {out_compare}")
 
 
 if __name__ == "__main__":
-    main()
+    # update the input dir, which at least contains
+    # such sub-folder: low, global_score, local_prior
+    input_dir = 'dataset/LOLv1/test'
+    main(input_dir)
