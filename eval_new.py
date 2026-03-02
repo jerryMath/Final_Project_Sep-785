@@ -1,5 +1,6 @@
 import torch
 import os
+from datetime import datetime
 import glob
 from model_incontext_revise import DiT_incontext_revise
 from diffusion import create_diffusion
@@ -13,6 +14,7 @@ import cv2
 import numpy as np
 import random
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
+from models_cvae import CVAE
 
 # Optimized settings
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
@@ -62,12 +64,26 @@ def main(inp_dir):
     lr_dir = os.path.join(inp_dir, 'low')
     high_dir = os.path.join(inp_dir, 'high')
     out_dir = os.path.join(inp_dir, 'outputs_diffusion_only')
+    # Save filename timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    out_compare = os.environ.get("OUT_DIR", "./eval_compare")
+    out_compare = os.path.join(out_compare, timestamp)
+    os.makedirs(out_compare, exist_ok=True)
     os.makedirs(out_dir, exist_ok=True)
 
     lr_paths = fiFindByWildcard(os.path.join(lr_dir, '*.png'))
     high_paths = fiFindByWildcard(os.path.join(high_dir, '*.png'))
 
     device = torch.device('cuda:0')
+
+    # ----- Load cVAE -----
+    cvae_ckpt_path = os.environ.get("CVAE_CKPT", "./runs_cvae/cvae_ep50.pt")
+    cvae = CVAE(base_ch=64, z_dim=128).to(device)
+    cvae_ckpt = torch.load(cvae_ckpt_path, map_location=device)
+    cvae.load_state_dict(cvae_ckpt["model"])
+    cvae.eval()
+
     # Transformer based on diffusions
     # diffusion Transformer backbone, with GPP-LN and LPP-Attn inside
     state_dict = load_model('./weights/1.pth')
@@ -102,7 +118,8 @@ def main(inp_dir):
     # ----- Metrics -----
     psnr = PeakSignalNoiseRatio(data_range=1.0).to(device)
     ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
-    ddpm_psnr, ddpm_ssim = [], []
+    cvae_psnr, ddpm_psnr = [], []
+    cvae_ssim, ddpm_ssim = [], []
 
     for lr_path, high_path in zip(lr_paths, high_paths):
         print(f"=== lr_path: {lr_path}")
@@ -113,6 +130,14 @@ def main(inp_dir):
         img = to_tensor(cv2.cvtColor(cv2.imread(lr_path), cv2.COLOR_BGR2RGB)).unsqueeze(0)
         print(f"=== img: {img.shape}")
         img_high = to_tensor(cv2.cvtColor(cv2.imread(high_path), cv2.COLOR_BGR2RGB)).unsqueeze(0)
+
+        # cVAE inference (deterministic z=0)
+        z = torch.zeros((1, cvae.z_dim), device=device)
+        cvae_pred = cvae.decode(img, z)
+        cvae01 = denorm(cvae_pred)
+
+        cvae_psnr.append(psnr(cvae01, high01).item())
+        cvae_ssim.append(ssim(cvae01, high01).item())
 
         b, c, h, w = img.shape
         # use less memo and run faster without calculating gradients
@@ -142,8 +167,13 @@ def main(inp_dir):
         print(f"=== save_img_path: {save_img_path}")
         save_image(sr, save_img_path)
 
+
+    print("\n===== Final Results =====")
+    print(f"cVAE  PSNR: {sum(cvae_psnr) / len(cvae_psnr):.3f}")
+    print(f"cVAE  SSIM: {sum(cvae_ssim) / len(cvae_ssim):.4f}")
     print(f"DDPM  PSNR: {sum(ddpm_psnr) / len(ddpm_psnr):.3f}")
     print(f"DDPM  SSIM: {sum(ddpm_ssim) / len(ddpm_ssim):.4f}")
+    print(f"Saved comparison images to: {out_compare}")
 
 
 if __name__ == "__main__":

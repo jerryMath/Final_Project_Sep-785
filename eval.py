@@ -1,8 +1,3 @@
-# eval.py
-# Compare cVAE vs DDPM (RESIDUAL DIFFUSION) on first N images and save:
-#   [ low | cVAE | DDPM | GT ]
-# Adds timestamp suffix to filenames.
-
 import os
 from datetime import datetime
 
@@ -35,8 +30,6 @@ def main():
     out_root = os.environ.get("OUT_DIR", "./eval_compare")
     out_root = os.path.join(out_root, timestamp)
     os.makedirs(out_root, exist_ok=True)
-
-    
 
     # Only evaluate first N images (default 3)
     n_imgs = int(os.environ.get("N_IMGS", 3))
@@ -84,8 +77,8 @@ def main():
         cvae_pred = cvae.decode(low, z)
 
         # DDPM inference: sample residual then add back to low
-        ddpm_res = ddpm.sample(low, steps=steps)         # residual_hat in [-1,1] (clamped in ddpm)
-        ddpm_pred = torch.clamp(low + 2.0 * ddpm_res, -1, 1)   # final enhanced
+        ddpm_res = ddpm.sample(low, steps=steps)  # residual_hat in [-1,1] (clamped in ddpm)
+        ddpm_pred = torch.clamp(low + 2.0 * ddpm_res, -1, 1)  # final enhanced
 
         # to [0,1]
         low01 = denorm(low)
@@ -108,10 +101,10 @@ def main():
         vutils.save_image(grid, os.path.join(out_root, save_name), nrow=4)
 
     print("\n===== Final Results =====")
-    print(f"cVAE  PSNR: {sum(cvae_psnr)/len(cvae_psnr):.3f}")
-    print(f"cVAE  SSIM: {sum(cvae_ssim)/len(cvae_ssim):.4f}")
-    print(f"DDPM  PSNR: {sum(ddpm_psnr)/len(ddpm_psnr):.3f}")
-    print(f"DDPM  SSIM: {sum(ddpm_ssim)/len(ddpm_ssim):.4f}")
+    print(f"cVAE  PSNR: {sum(cvae_psnr) / len(cvae_psnr):.3f}")
+    print(f"cVAE  SSIM: {sum(cvae_ssim) / len(cvae_ssim):.4f}")
+    print(f"DDPM  PSNR: {sum(ddpm_psnr) / len(ddpm_psnr):.3f}")
+    print(f"DDPM  SSIM: {sum(ddpm_ssim) / len(ddpm_ssim):.4f}")
     print(f"Saved comparison images to: {out_root}")
 
 
