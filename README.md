@@ -109,6 +109,4 @@ However:
 - NIQE evaluation
 
 ### 📚 References
-- Kingma & Welling (VAE)
-- Ho et al. (DDPM)
-- Blau & Michaeli (Perception–Distortion Tradeoff)
+- See report
