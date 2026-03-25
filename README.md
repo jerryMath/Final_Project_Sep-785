@@ -56,9 +56,13 @@ Confirms the perception–distortion tradeoff
   
 ### ⚙️ Training Highlights
 - cVAE
-  - Loss = L1 + KL
-  - β = 1e-3
-  - Stable and efficient
+| Parameter          | Environment Variable | Default Value |
+|-------------------|---------------------|--------------|
+| Image size        | IMG_SIZE            | 256          |
+| Batch size        | BS                  | 8            |
+| Epochs            | EPOCHS              | 50           |
+| Learning rate     | LR                  | 2 × 10⁻⁴     |
+| KL weight (β)     | BETA                | 1 × 10⁻³     |
 
 - Diffusion
   - Noise prediction objective
