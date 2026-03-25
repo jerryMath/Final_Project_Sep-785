@@ -56,6 +56,7 @@ Confirms the perception–distortion tradeoff
   
 ### ⚙️ Training Highlights
 - cVAE
+
 | Parameter          | Environment Variable | Default Value |
 |-------------------|---------------------|--------------|
 | Image size        | IMG_SIZE            | 256          |
