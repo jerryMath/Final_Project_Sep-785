@@ -66,9 +66,16 @@ Confirms the perception–distortion tradeoff
 | KL weight (β)     | BETA                | 1 × 10⁻³     |
 
 - Diffusion
-  - Noise prediction objective
-  - Latent space training
-  - Multi-step sampling (25 steps)
+
+| Item           | Value |
+|----------------|------|
+| Optimizer      | AdamW |
+| LR             | 1 × 10⁻⁴ |
+| Weight Decay   | None |
+| Scheduler      | Multi-step (γ = 0.5) |
+| Milestones     | 2500, 3500, 4000, 4500, 4800 |
+| Loss           | VB + MSE |
+| Objective      | Accuracy + probabilistic consistency |
 
 ### 🖼️ Results
 
