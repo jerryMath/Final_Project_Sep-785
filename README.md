@@ -1,7 +1,7 @@
 # A Comparative Study of Conditional Variational Autoencoders and Diffusion Models for Low-Light Image Enhancement (LLIE)
 
 ## SEP 785:Machine Learning
-### Group 12
+### 🚀 Group 12
 
 A research-driven comparison of Conditional Variational Autoencoders (cVAE) and Diffusion Models (DDPM) for low-light image enhancement.
 
